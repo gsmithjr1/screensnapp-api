@@ -1,0 +1,103 @@
+{
+	"info": {
+		"_postman_id": "d91c018e-774b-4678-9ba0-921891c27040",
+		"name": "clarifai",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Health Check",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/health",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"health"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "by_image",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearer_token}}",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "formdata",
+					"formdata": [
+						{
+							"key": "file",
+							"type": "file",
+							"src": "/D:/AG_APPS/clarifai/images/image (1).png"
+						}
+					]
+				},
+				"url": {
+					"raw": "{{base_url}}/analyze-image",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"analyze-image"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "by_url",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearer_token}}",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n  \"url\": \"string\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{base_url}}/analyze-image-url",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"analyze-image-url"
+					]
+				}
+			},
+			"response": []
+		}
+	],
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"type": "string"
+		},
+		{
+			"key": "bearer_token",
+			"value": "test_token_12345",
+			"type": "string"
+		}
+	]
+}

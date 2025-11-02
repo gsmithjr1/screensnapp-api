@@ -1,0 +1,6 @@
+fastapi==0.115.14
+clarifai-grpc==11.5.5
+uvicorn==0.33.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+

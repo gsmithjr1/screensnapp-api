@@ -1,0 +1,15 @@
+services:
+  fastapi-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - CLARIFAI_PAT=7607dc924f7d48cb9498d01f28fcb71d
+      - CLARIFAI_USER_ID=nxi9k6mtpija
+      - CLARIFAI_APP_ID=ScreenSnapp-Vision
+      - CLARIFAI_MODEL_ID=set-2
+      - CLARIFAI_MODEL_VERSION_ID=f2fb3217afa341ce87545e1ba7bf0b64
+    volumes:
+      - .:/app
