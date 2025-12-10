@@ -1,6 +1,6 @@
 import os
 import base64
-from fastapi import FastAPI, UploadFile, File, requests, HTTPException, Depends, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -10,7 +10,7 @@ from clarifai_grpc.grpc.api.status import status_code_pb2
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
-
+import requests
 # Load environment variables from .env file
 load_dotenv()
 
@@ -160,5 +160,6 @@ async def predict_from_url(
             "name": concept.name,
             "confidence": round(concept.value, 4)
         })
+
 
     return {"predictions": predictions}
