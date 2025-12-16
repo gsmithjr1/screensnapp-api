@@ -119,23 +119,19 @@ async def predict_from_url(
     image_url: ImageURL,
     token: str = Depends(verify_token)
 ):
-        try:
-        # Fetch the image from the URL
-        response = requests.get(image_url.url, timeout=10)
-        response.raise_for_status()
-        image_bytes = response.content
-
-        # Encode the image bytes to base64 BUT KEEP AS BYTES
-        image_base64 = base64.b64encode(image_bytes)  # <-- NO .decode()
+    # 1) Fetch image from URL
+    try:
+        resp = requests.get(image_url.url, timeout=10)
+        resp.raise_for_status()
+        image_bytes = resp.content  # <-- RAW BYTES
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error fetching or encoding image: {e}")
-
+        raise HTTPException(
             status_code=400,
             detail=f"Error fetching or encoding image: {e}"
         )
 
+    # 2) Send raw bytes directly to Clarifai (NO base64.decode)
     try:
-        # 3) Call Clarifai
         clarifai_response = stub.PostModelOutputs(
             service_pb2.PostModelOutputsRequest(
                 user_app_id=user_data,
@@ -144,41 +140,32 @@ async def predict_from_url(
                 inputs=[
                     resources_pb2.Input(
                         data=resources_pb2.Data(
-                            image=resources_pb2.Image(base64=image_base64)
+                            image=resources_pb2.Image(base64=image_bytes)
                         )
                     )
                 ]
             ),
             metadata=metadata
         )
-
     except Exception as e:
-        # If gRPC itself fails (bad creds, network, etc.)
         raise HTTPException(
             status_code=500,
             detail=f"Clarifai call failed: {e}"
         )
 
-    # 4) Clarifai responded but with an error status
+    # 3) Check Clarifai status
     if clarifai_response.status.code != status_code_pb2.SUCCESS:
         raise HTTPException(
             status_code=500,
             detail=f"Clarifai error: {clarifai_response.status.description}"
         )
 
-    # 5) Extract predictions safely
+    # 4) Extract predictions
     predictions = []
-    try:
-        for concept in clarifai_response.outputs[0].data.concepts:
-            predictions.append({
-                "name": concept.name,
-                "confidence": round(concept.value, 4)
-            })
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error parsing Clarifai response: {e}"
-        )
+    for concept in clarifai_response.outputs[0].data.concepts:
+        predictions.append({
+            "name": concept.name,
+            "confidence": round(concept.value, 4)
+        })
 
     return {"predictions": predictions}
-
