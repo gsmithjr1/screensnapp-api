@@ -119,18 +119,17 @@ async def predict_from_url(
     image_url: ImageURL,
     token: str = Depends(verify_token)
 ):
-    try:
-        # 1) Fetch the image
-        resp = requests.get(image_url.url, timeout=10)
-        resp.raise_for_status()
-        image_bytes = resp.content
+        try:
+        # Fetch the image from the URL
+        response = requests.get(image_url.url, timeout=10)
+        response.raise_for_status()
+        image_bytes = response.content
 
-        # 2) Encode as base64 string
-        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-
+        # Encode the image bytes to base64 BUT KEEP AS BYTES
+        image_base64 = base64.b64encode(image_bytes)  # <-- NO .decode()
     except Exception as e:
-        # Network / encoding problems
-        raise HTTPException(
+        raise HTTPException(status_code=400, detail=f"Error fetching or encoding image: {e}")
+
             status_code=400,
             detail=f"Error fetching or encoding image: {e}"
         )
@@ -182,3 +181,4 @@ async def predict_from_url(
         )
 
     return {"predictions": predictions}
+
