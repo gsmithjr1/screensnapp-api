@@ -1,6 +1,8 @@
 import os
 import base64
-from fastapi import FastAPI, UploadFile, File, requests, HTTPException, Depends, Header
+import requests
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -160,5 +162,6 @@ async def predict_from_url(
             "name": concept.name,
             "confidence": round(concept.value, 4)
         })
+
 
     return {"predictions": predictions}
