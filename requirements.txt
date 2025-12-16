@@ -3,4 +3,11 @@ clarifai-grpc==11.5.5
 uvicorn==0.33.0
 python-dotenv==1.0.1
 python-multipart==0.0.20
+fastapi
+uvicorn
+clarifai-grpc
+pydantic
+python-dotenv
+requests==2.31.0
+
 
