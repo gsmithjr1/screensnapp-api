@@ -23,7 +23,11 @@ MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "set-2")
 MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "f2fb3217afa341ce87545e1ba7bf0b64")
 
 # Bearer token for authentication - prioritize environment variable, fallback to test token
-BEARER_TOKEN = (os.getenv("API_BEARER_TOKEN") or "").strip()
+BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "test_token_12345").strip()
+incoming = credentials.credentials.strip()
+if incoming != BEARER_TOKEN:
+    raise HTTPException(status_code=401, detail="Invalid authentication token")
+
 if not BEARER_TOKEN:
     raise RuntimeError("API_BEARER_TOKEN is not set")
 
@@ -171,5 +175,6 @@ async def predict_from_url(
         })
 
     return {"predictions": predictions}
+
 
 
