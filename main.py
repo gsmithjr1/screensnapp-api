@@ -1,198 +1,157 @@
 import os
-import base64
 import requests
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
 from clarifai_grpc.channel.clarifai_channel import ClarifaiChannel
 from clarifai_grpc.grpc.api import resources_pb2, service_pb2, service_pb2_grpc
 from clarifai_grpc.grpc.api.status import status_code_pb2
-from pydantic import BaseModel
-from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load env vars (local dev). On Railway, env vars come from Variables tab.
 load_dotenv()
 
-# Clarifai credentials
+# ----------------------------
+# ENV / CONFIG
+# ----------------------------
 PAT = os.getenv("CLARIFAI_PAT", "").strip()
-    if not PAT:
-    raise RuntimeError("CLARIFAI_PAT is not set")
-USER_ID = os.getenv("CLARIFAI_USER_ID", "nxi9k6mtpija")
-APP_ID = os.getenv("CLARIFAI_APP_ID", "ScreenSnapp-Vision")
-MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "set-2")
-MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "f2fb3217afa341ce87545e1ba7bf0b64")
+USER_ID = os.getenv("CLARIFAI_USER_ID", "nxi9k6mtpija").strip()
+APP_ID = os.getenv("CLARIFAI_APP_ID", "ScreenSnapp-Vision").strip()
 
-# Bearer token for authentication - prioritize environment variable, fallback to test token
-# Bearer token for authentication (must come from env in production)
+MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "set-2").strip()
+MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "").strip()
+
 BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
 
-# Security scheme
-security = HTTPBearer(auto_error=True)
+# Fail fast with clear error (prevents mystery 502s)
+if not PAT:
+    raise RuntimeError("CLARIFAI_PAT is not set (Railway Variables → CLARIFAI_PAT).")
+if not BEARER_TOKEN:
+    raise RuntimeError("API_BEARER_TOKEN is not set (Railway Variables → API_BEARER_TOKEN).")
+
+# ----------------------------
+# Clarifai gRPC setup
+# ----------------------------
+channel = ClarifaiChannel.get_grpc_channel()
+stub = service_pb2_grpc.V2Stub(channel)
+metadata = (("authorization", "Key " + PAT),)
+user_data = resources_pb2.UserAppIDSet(user_id=USER_ID, app_id=APP_ID)
+
+# ----------------------------
+# FastAPI app
+# ----------------------------
+app = FastAPI(
+    title="ScreenSnapp Clarifai Image Analysis API",
+    description="Analyze images using Clarifai models (protected by Bearer auth).",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+security = HTTPBearer()
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     incoming = (credentials.credentials or "").strip()
-
-    if not BEARER_TOKEN:
-        # If this triggers, your Railway variable is missing
-        raise HTTPException(status_code=500, detail="API_BEARER_TOKEN is not set")
-
     if incoming != BEARER_TOKEN:
         raise HTTPException(
             status_code=401,
             detail="Invalid authentication token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    return incoming
 
-    return True
+# ----------------------------
+# Helpers
+# ----------------------------
+def call_clarifai_with_bytes(image_bytes: bytes):
+    """Send raw bytes to Clarifai and return concept predictions."""
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty image data")
 
-# Setup Clarifai gRPC
-channel = ClarifaiChannel.get_grpc_channel()
-stub = service_pb2_grpc.V2Stub(channel)
-metadata = (('authorization', 'Key ' + PAT),)
-user_data = resources_pb2.UserAppIDSet(user_id=USER_ID, app_id=APP_ID)
+    # Build request
+    req = service_pb2.PostModelOutputsRequest(
+        user_app_id=user_data,
+        model_id=MODEL_ID,
+        inputs=[
+            resources_pb2.Input(
+                data=resources_pb2.Data(
+                    image=resources_pb2.Image(base64=image_bytes)  # Clarifai expects BYTES here
+                )
+            )
+        ],
+    )
 
-# Security scheme
-security = HTTPBearer()
+    # Only include version_id if you actually set it
+    if MODEL_VERSION_ID:
+        req.version_id = MODEL_VERSION_ID
 
-app = FastAPI(
-    title="Clarifai Image Analysis API",
-    description="API for analyzing images using Clarifai AI models",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
+    # Call Clarifai
+    resp = stub.PostModelOutputs(req, metadata=metadata)
 
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify the Bearer token"""
-    if credentials.credentials != BEARER_TOKEN:
+    if resp.status.code != status_code_pb2.SUCCESS:
         raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=500,
+            detail=f"Clarifai error: {resp.status.description}",
         )
-    return credentials.credentials
 
+    concepts = resp.outputs[0].data.concepts if resp.outputs else []
+    predictions = [
+        {"name": c.name, "confidence": round(float(c.value), 4)}
+        for c in concepts
+    ]
+    return predictions
+
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Clarifai Image Analysis API",
+        "service": "ScreenSnapp Clarifai Image Analysis API",
         "version": "1.0.0",
         "auth_enabled": True,
-        "token_source": "environment" if os.getenv("API_BEARER_TOKEN") else "default"
+        "model_id": MODEL_ID,
+        "model_version_id_set": bool(MODEL_VERSION_ID),
     }
 
 @app.post("/analyze-image")
-async def predict_from_image(
+async def analyze_image(
     file: UploadFile = File(...),
-    token: str = Depends(verify_token)
+    token: str = Depends(verify_token),
 ):
-    print("Received file: ")
-    # Read image and encode
-    image_bytes = await file.read()
-
-    # Send image to Clarifai
-    response = stub.PostModelOutputs(
-        service_pb2.PostModelOutputsRequest(
-            user_app_id=user_data,
-            model_id=MODEL_ID,
-            version_id=MODEL_VERSION_ID,
-            inputs=[
-                resources_pb2.Input(
-                    data=resources_pb2.Data(
-                        image=resources_pb2.Image(base64=image_bytes)
-                    )
-                )
-            ]
-        ),
-        metadata=metadata
-    )
-
-    # Check for errors
-    if response.status.code != status_code_pb2.SUCCESS:
-        return JSONResponse(
-            status_code=500,
-            content={"error": response.status.description}
-        )
-
-    # Extract predictions
-    predictions = []
-    for concept in response.outputs[0].data.concepts:
-        predictions.append({
-            "name": concept.name,
-            "confidence": round(concept.value, 4)
-        })
-
-    return {"predictions": predictions}
-
-
-
-import base64
+    try:
+        image_bytes = await file.read()
+        predictions = call_clarifai_with_bytes(image_bytes)
+        return {"predictions": predictions}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
 
 class ImageURL(BaseModel):
     url: str
 
 @app.post("/analyze-image-url")
-async def predict_from_url(
+async def analyze_image_url(
     image_url: ImageURL,
-    token: str = Depends(verify_token)
+    token: str = Depends(verify_token),
 ):
-    # 1) Fetch image from URL
+    # fetch image
     try:
-        resp = requests.get(image_url.url, timeout=10)
-        resp.raise_for_status()
-        image_bytes = resp.content  # <-- RAW BYTES
+        r = requests.get(image_url.url, timeout=15)
+        r.raise_for_status()
+        image_bytes = r.content
     except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Error fetching or encoding image: {e}"
-        )
+        raise HTTPException(status_code=400, detail=f"Error fetching image URL: {e}")
 
-    # 2) Send raw bytes directly to Clarifai (NO base64.decode)
     try:
-        clarifai_response = stub.PostModelOutputs(
-            service_pb2.PostModelOutputsRequest(
-                user_app_id=user_data,
-                model_id=MODEL_ID,
-                version_id=MODEL_VERSION_ID,
-                inputs=[
-                    resources_pb2.Input(
-                        data=resources_pb2.Data(
-                            image=resources_pb2.Image(base64=image_bytes)
-                        )
-                    )
-                ]
-            ),
-            metadata=metadata
-        )
+        predictions = call_clarifai_with_bytes(image_bytes)
+        return {"predictions": predictions}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Clarifai call failed: {e}"
-        )
-
-    # 3) Check Clarifai status
-    if clarifai_response.status.code != status_code_pb2.SUCCESS:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Clarifai error: {clarifai_response.status.description}"
-        )
-
-    # 4) Extract predictions
-    predictions = []
-    for concept in clarifai_response.outputs[0].data.concepts:
-        predictions.append({
-            "name": concept.name,
-            "confidence": round(concept.value, 4)
-        })
-
-    return {"predictions": predictions}
-
-
-
-
-
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
