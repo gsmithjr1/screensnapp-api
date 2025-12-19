@@ -16,7 +16,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Clarifai credentials
-PAT = os.getenv("CLARIFAI_PAT", "7607dc924f7d48cb9498d01f28fcb71d")
+PAT = os.getenv("CLARIFAI_PAT", "").strip()
+    if not PAT:
+    raise RuntimeError("CLARIFAI_PAT is not set")
 USER_ID = os.getenv("CLARIFAI_USER_ID", "nxi9k6mtpija")
 APP_ID = os.getenv("CLARIFAI_APP_ID", "ScreenSnapp-Vision")
 MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "set-2")
@@ -189,6 +191,7 @@ async def predict_from_url(
         })
 
     return {"predictions": predictions}
+
 
 
 
