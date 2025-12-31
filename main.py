@@ -17,11 +17,17 @@ load_dotenv()
 # ----------------------------
 # ENV / CONFIG
 # ----------------------------
+# ----------------------------
+# ENV / CONFIG
+# ----------------------------
 PAT = os.getenv("CLARIFAI_PAT", "").strip()
-USER_ID = os.getenv("CLARIFAI_USER_ID", "nxi9k6mtpija").strip()
-APP_ID = os.getenv("CLARIFAI_APP_ID", "ScreenSnapp-Vision").strip()
+USER_ID = os.getenv("CLARIFAI_USER_ID", "clarifai").strip()
+APP_ID = os.getenv("CLARIFAI_APP_ID", "main").strip()
 
-MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "set-2").strip()
+# ✅ Use a guaranteed public Clarifai model by default (fixes "Resource does not exist")
+MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "general-image-recognition").strip()
+
+# ✅ Don't use a model version unless you REALLY have one
 MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "").strip()
 
 BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
