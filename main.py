@@ -43,7 +43,10 @@ MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "").strip()
 BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
 
 # TMDB
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+if not TMDB_API_KEY:
+    raise RuntimeError("TMDB_API_KEY is missing")
+
 
 # OCR model (you must set these in Railway Variables)
 OCR_MODEL_ID = os.getenv("CLARIFAI_OCR_MODEL_ID", "").strip()
@@ -299,5 +302,6 @@ async def identify_screen(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
 
 
