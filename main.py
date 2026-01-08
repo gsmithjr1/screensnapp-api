@@ -10,6 +10,13 @@ from clarifai_grpc.channel.clarifai_channel import ClarifaiChannel
 from clarifai_grpc.grpc.api import resources_pb2, service_pb2, service_pb2_grpc
 from clarifai_grpc.grpc.api.status import status_code_pb2
 
+print("=== ENV CHECK ===")
+print("CLARIFAI_PAT exists:", bool(os.getenv("CLARIFAI_PAT")))
+print("CLARIFAI_USER_ID:", os.getenv("CLARIFAI_USER_ID"))
+print("CLARIFAI_APP_ID:", os.getenv("CLARIFAI_APP_ID"))
+print("=================")
+
+
 # Load env vars (local dev). On Railway, env vars come from Variables tab.
 load_dotenv()
 
@@ -286,3 +293,4 @@ async def identify_screen(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
