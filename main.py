@@ -16,6 +16,12 @@ print("CLARIFAI_USER_ID:", os.getenv("CLARIFAI_USER_ID"))
 print("CLARIFAI_APP_ID:", os.getenv("CLARIFAI_APP_ID"))
 print("=================")
 
+app = FastAPI()
+
+@app.post("/identify-screen")
+async def identify_screen(file: UploadFile = File(...)):
+    ...
+
 
 # Load env vars (local dev). On Railway, env vars come from Variables tab.
 load_dotenv()
@@ -293,4 +299,5 @@ async def identify_screen(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
 
