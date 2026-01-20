@@ -1,249 +1,343 @@
-# main.py
 import os
-import base64
-from typing import Optional, List
+import re
+import json
+import logging
+from typing import Optional, Dict, Any, List
 
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-
-# Clarifai gRPC
-from clarifai_grpc.channel.clarifai_channel import ClarifaiChannel
-from clarifai_grpc.grpc.api import service_pb2, service_pb2_grpc, resources_pb2
-from clarifai_grpc.grpc.api.status import status_code_pb2
-
+from fastapi.responses import JSONResponse
 
 # ----------------------------
-# App
+# Logging
+# ----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("screensnapp-api")
+
+# ----------------------------
+# FastAPI app
 # ----------------------------
 app = FastAPI(title="ScreenSnapp API", version="1.0.0")
 
+# If you need CORS (usually not needed for iOS native, but harmless)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ----------------------------
+# ENV / CONFIG
+# ----------------------------
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
+
+CLARIFAI_PAT = os.getenv("CLARIFAI_PAT", "").strip()
+CLARIFAI_USER_ID = os.getenv("CLARIFAI_USER_ID", "").strip()   # ex: "clarifai" or your user
+CLARIFAI_APP_ID = os.getenv("CLARIFAI_APP_ID", "").strip()     # ex: "main" or your app id
+CLARIFAI_OCR_MODEL_ID = os.getenv("CLARIFAI_OCR_MODEL_ID", "").strip()
+
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+
+# Optional "sanity" var you used earlier
+TEST_PERSIST = os.getenv("TEST_PERSIST", "").strip()
+
+# Clarifai REST endpoint
+CLARIFAI_API_BASE = "https://api.clarifai.com/v2"
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def require_env(name: str) -> str:
-    val = os.getenv(name, "").strip()
-    if not val:
-        raise HTTPException(status_code=500, detail=f"Server misconfigured: {name} is missing")
-    return val
+def require_env(name: str, value: str):
+    if not value:
+        raise RuntimeError(f"{name} is missing (Railway Variables -> {name})")
 
 
-def get_optional_env(name: str) -> str:
-    return os.getenv(name, "").strip()
-
-
-def require_bearer(authorization: Optional[str] = Header(default=None)):
+def bearer_auth(authorization: Optional[str] = Header(default=None)):
     """
-    If API_BEARER_TOKEN is set in Railway, require:
+    If API_BEARER_TOKEN is set, require:
       Authorization: Bearer <token>
-    If API_BEARER_TOKEN is empty, auth is skipped (dev-friendly).
+    If API_BEARER_TOKEN is empty, allow requests without auth.
     """
-    expected = get_optional_env("API_BEARER_TOKEN")
-    if not expected:
-        return True
+    if not API_BEARER_TOKEN:
+        return  # auth disabled
 
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-    got = authorization.split(" ", 1)[1].strip()
-    if got != expected:
-        raise HTTPException(status_code=401, detail="Invalid Bearer token")
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
 
-    return True
+    token = parts[1].strip()
+    if token != API_BEARER_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def clarifai_ocr_extract_text(image_bytes: bytes) -> str:
+def extract_text_from_clarifai_response(data: Dict[str, Any]) -> str:
     """
-    Runs Clarifai OCR model and extracts text.
-    Required env:
-      CLARIFAI_PAT
-      CLARIFAI_USER_ID
-      CLARIFAI_APP_ID
-      CLARIFAI_OCR_MODEL_ID
-    Optional env:
-      CLARIFAI_OCR_MODEL_VERSION_ID  (if you want to pin a version)
+    Tries a few common Clarifai response formats.
+    OCR models often return "regions" with text, or "concepts" etc.
+    We'll gather any obvious strings we can find.
     """
-    pat = require_env("CLARIFAI_PAT")
-    user_id = require_env("CLARIFAI_USER_ID")
-    app_id = require_env("CLARIFAI_APP_ID")
-    model_id = require_env("CLARIFAI_OCR_MODEL_ID")
-    model_version_id = get_optional_env("CLARIFAI_OCR_MODEL_VERSION_ID")
-
-    channel = ClarifaiChannel.get_grpc_channel()
-    stub = service_pb2_grpc.V2Stub(channel)
-
-    metadata = (("authorization", f"Key {pat}"),)
-
-    image = resources_pb2.Image(base64=base64.b64encode(image_bytes))
-    input_ = resources_pb2.Input(data=resources_pb2.Data(image=image))
-
-    if model_version_id:
-        req = service_pb2.PostModelOutputsRequest(
-            user_app_id=resources_pb2.UserAppIDSet(user_id=user_id, app_id=app_id),
-            model_id=model_id,
-            version_id=model_version_id,
-            inputs=[input_],
-        )
-    else:
-        req = service_pb2.PostModelOutputsRequest(
-            user_app_id=resources_pb2.UserAppIDSet(user_id=user_id, app_id=app_id),
-            model_id=model_id,
-            inputs=[input_],
-        )
-
-    resp = stub.PostModelOutputs(req, metadata=metadata)
-
-    if resp.status.code != status_code_pb2.SUCCESS:
-        # Clarifai error info
-        raise HTTPException(
-            status_code=502,
-            detail=f"Clarifai error: {resp.status.code} - {resp.status.description}",
-        )
-
-    # OCR models often return text in regions -> data.text.raw / data.regions[].data.text.raw
-    output = resp.outputs[0]
-    data = output.data
-
     texts: List[str] = []
 
-    # Some models fill data.text.raw
-    if getattr(data, "text", None) and getattr(data.text, "raw", ""):
-        texts.append(data.text.raw)
+    try:
+        outputs = data.get("outputs", [])
+        if not outputs:
+            return ""
 
-    # Many OCR models fill regions with per-region text
-    for region in data.regions:
-        try:
-            raw = region.data.text.raw
+        output0 = outputs[0]
+        d = output0.get("data", {})
+
+        # Many text/OCR models: data["regions"][i]["data"]["text"]["raw"]
+        regions = d.get("regions", [])
+        for r in regions:
+            raw = (
+                r.get("data", {})
+                 .get("text", {})
+                 .get("raw", "")
+            )
             if raw:
                 texts.append(raw)
-        except Exception:
-            pass
 
-    combined = " ".join([t.strip() for t in texts if t and t.strip()])
-    return combined.strip()
+        # Some models return data["text"]["raw"]
+        raw_text = d.get("text", {}).get("raw", "")
+        if raw_text:
+            texts.append(raw_text)
+
+        # Some return concepts with name strings (less common for OCR)
+        concepts = d.get("concepts", [])
+        for c in concepts:
+            name = c.get("name", "")
+            if name and isinstance(name, str):
+                texts.append(name)
+
+    except Exception:
+        # If parsing fails, return empty and let caller handle
+        return ""
+
+    # Cleanup: join, remove duplicates while preserving order
+    seen = set()
+    cleaned = []
+    for t in texts:
+        t2 = t.strip()
+        if t2 and t2.lower() not in seen:
+            seen.add(t2.lower())
+            cleaned.append(t2)
+
+    return " ".join(cleaned).strip()
 
 
-def tmdb_search_multi(query: str) -> dict:
+def guess_title_from_text(ocr_text: str) -> str:
     """
-    Uses TMDB v3 API Key.
-    Required env:
-      TMDB_API_KEY
+    Very basic guess: pick the longest "title-like" phrase.
+    You can improve this later (or switch to embeddings matching).
     """
-    api_key = require_env("TMDB_API_KEY")
+    if not ocr_text:
+        return ""
+
+    # Remove junk characters
+    s = re.sub(r"[\r\n\t]+", " ", ocr_text)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+
+    # Split into chunks that look like words
+    candidates = re.split(r"[|•·]+", s)
+    candidates = [c.strip() for c in candidates if c.strip()]
+
+    # Prefer longer candidates but not insane length
+    candidates.sort(key=lambda x: len(x), reverse=True)
+    for c in candidates:
+        if 3 <= len(c) <= 80:
+            # Avoid strings that are mostly numbers
+            if sum(ch.isalpha() for ch in c) >= 3:
+                return c
+
+    return s[:80]
+
+
+def tmdb_search(query: str) -> Dict[str, Any]:
+    """
+    Search both movie + tv and return best hit.
+    """
+    require_env("TMDB_API_KEY", TMDB_API_KEY)
+
+    if not query:
+        return {"found": False, "reason": "Empty query"}
 
     url = "https://api.themoviedb.org/3/search/multi"
-    params = {
-        "api_key": api_key,
-        "query": query,
-        "include_adult": "false",
-        "language": "en-US",
-        "page": 1,
+    params = {"api_key": TMDB_API_KEY, "query": query, "include_adult": "false"}
+    r = requests.get(url, params=params, timeout=20)
+
+    if r.status_code != 200:
+        return {
+            "found": False,
+            "reason": "TMDB error",
+            "status_code": r.status_code,
+            "body": r.text[:500],
+        }
+
+    data = r.json()
+    results = data.get("results", [])
+    if not results:
+        return {"found": False, "reason": "No results"}
+
+    # Pick top result
+    best = results[0]
+    media_type = best.get("media_type")
+
+    title = best.get("title") or best.get("name") or ""
+    overview = best.get("overview") or ""
+    poster_path = best.get("poster_path")
+    release_date = best.get("release_date") or best.get("first_air_date") or ""
+    tmdb_id = best.get("id")
+
+    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
+
+    return {
+        "found": True,
+        "media_type": media_type,
+        "tmdb_id": tmdb_id,
+        "title": title,
+        "overview": overview,
+        "release_date": release_date,
+        "poster_url": poster_url,
+        "raw": best,  # keep for debugging
     }
 
-    r = requests.get(url, params=params, timeout=20)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"TMDB error: {r.status_code} {r.text[:200]}")
-    return r.json()
 
-
-def choose_best_tmdb_result(tmdb_json: dict) -> Optional[dict]:
+def clarifai_ocr(image_bytes: bytes) -> Dict[str, Any]:
     """
-    Picks the top result (you can improve ranking later).
+    Calls Clarifai REST predict endpoint for the OCR model.
     """
-    results = tmdb_json.get("results", []) or []
-    if not results:
-        return None
+    require_env("CLARIFAI_PAT", CLARIFAI_PAT)
+    require_env("CLARIFAI_USER_ID", CLARIFAI_USER_ID)
+    require_env("CLARIFAI_APP_ID", CLARIFAI_APP_ID)
+    require_env("CLARIFAI_OCR_MODEL_ID", CLARIFAI_OCR_MODEL_ID)
 
-    # Prefer movie/tv over people
-    def score(item: dict) -> int:
-        media_type = item.get("media_type")
-        base = 0
-        if media_type == "movie":
-            base += 30
-        elif media_type == "tv":
-            base += 25
-        else:
-            base -= 10
+    url = f"{CLARIFAI_API_BASE}/users/{CLARIFAI_USER_ID}/apps/{CLARIFAI_APP_ID}/models/{CLARIFAI_OCR_MODEL_ID}/outputs"
 
-        # Popularity + vote_count helps a bit
-        base += int(item.get("popularity", 0) or 0)
-        base += int((item.get("vote_count", 0) or 0) / 10)
-        return base
+    headers = {
+        "Authorization": f"Key {CLARIFAI_PAT}",
+        "Content-Type": "application/json",
+    }
 
-    results.sort(key=score, reverse=True)
-    return results[0]
+    payload = {
+        "inputs": [
+            {
+                "data": {
+                    "image": {
+                        "base64": image_bytes.hex()  # placeholder
+                    }
+                }
+            }
+        ]
+    }
+
+    # Clarifai expects base64, not hex — do it correctly:
+    import base64
+    payload["inputs"][0]["data"]["image"]["base64"] = base64.b64encode(image_bytes).decode("utf-8")
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "Clarifai request failed",
+                "status_code": resp.status_code,
+                "body": resp.text[:1000],
+            },
+        )
+
+    data = resp.json()
+
+    # Clarifai can return status codes inside JSON too
+    status = data.get("status", {})
+    if status and status.get("code") not in (None, 10000):
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "Clarifai non-success status", "status": status},
+        )
+
+    return data
 
 
 # ----------------------------
 # Routes
 # ----------------------------
-@app.get("/health")
+@app.get("/")
 def health():
-    return {"ok": True}
+    return {
+        "status": "ok",
+        "service": "screensnapp-api",
+        "has_auth": bool(API_BEARER_TOKEN),
+        "test_persist": TEST_PERSIST or None,
+    }
 
 
 @app.post("/identify-screen")
 async def identify_screen(
     file: UploadFile = File(...),
-    _auth_ok: bool = Depends(require_bearer),
+    _auth: None = Depends(bearer_auth),
 ):
     """
-    Accepts multipart/form-data with field name "file"
-    Returns:
-      - extracted_text
-      - tmdb_best_match (if found)
-      - tmdb_results_count
+    iOS should POST multipart/form-data with key = "file"
     """
     try:
         if not file:
-            raise HTTPException(status_code=400, detail="Missing file")
+            raise HTTPException(status_code=400, detail="No file uploaded")
 
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="Empty file")
+        contents = await file.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-        # 1) OCR via Clarifai
-        extracted_text = clarifai_ocr_extract_text(content)
+        logger.info(f"Received file: filename={file.filename} content_type={file.content_type} size={len(contents)}")
 
-        if not extracted_text:
-            return {
-                "status": "ok",
-                "extracted_text": "",
-                "tmdb_query": "",
-                "tmdb_results_count": 0,
-                "tmdb_best_match": None,
-                "message": "No text detected. Try getting the title more centered/clear.",
-            }
+        # 1) Clarifai OCR
+        clarifai_data = clarifai_ocr(contents)
+        ocr_text = extract_text_from_clarifai_response(clarifai_data)
 
-        # Keep the query reasonable (TMDB doesn't need giant text blobs)
-        tmdb_query = extracted_text.strip()
-        if len(tmdb_query) > 120:
-            tmdb_query = tmdb_query[:120]
+        # 2) Guess a title to search in TMDB
+        guessed_title = guess_title_from_text(ocr_text)
 
-        # 2) TMDB search
-        tmdb_json = tmdb_search_multi(tmdb_query)
-        best = choose_best_tmdb_result(tmdb_json)
+        # 3) TMDB search
+        tmdb_result = tmdb_search(guessed_title)
 
-        return {
-            "status": "ok",
-            "extracted_text": extracted_text,
-            "tmdb_query": tmdb_query,
-            "tmdb_results_count": len(tmdb_json.get("results", []) or []),
-            "tmdb_best_match": best,
-            "tmdb_raw": tmdb_json,  # you can remove later if you want smaller responses
-        }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "filename": file.filename,
+                "content_type": file.content_type,
+                "ocr_text": ocr_text,
+                "guessed_title": guessed_title,
+                "tmdb": tmdb_result,
+            },
+        )
 
     except HTTPException:
         raise
+    except RuntimeError as e:
+        # Missing env vars etc.
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        # Never crash the server; return a clean error
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        logger.exception("Unhandled error in /identify-screen")
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+
+# Helpful: a route to verify your server sees env vars (DON'T expose in public long-term)
+@app.get("/debug/env")
+def debug_env(_auth: None = Depends(bearer_auth)):
+    return {
+        "API_BEARER_TOKEN_set": bool(API_BEARER_TOKEN),
+        "CLARIFAI_PAT_set": bool(CLARIFAI_PAT),
+        "CLARIFAI_USER_ID": CLARIFAI_USER_ID or None,
+        "CLARIFAI_APP_ID": CLARIFAI_APP_ID or None,
+        "CLARIFAI_OCR_MODEL_ID_set": bool(CLARIFAI_OCR_MODEL_ID),
+        "TMDB_API_KEY_set": bool(TMDB_API_KEY),
+        "TEST_PERSIST": TEST_PERSIST or None,
+    }
