@@ -1,25 +1,32 @@
+# main.py
 import os
-import re
+import base64
 import requests
-from typing import Optional, Dict, Any, List
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from clarifai_grpc.channel.clarifai_channel import ClarifaiChannel
-from clarifai_grpc.grpc.api import service_pb2_grpc, service_pb2, resources_pb2
-from clarifai_grpc.grpc.api.status import status_code_pb2
-
-# ----------------------------
-# Load .env locally (Railway uses Variables)
-# ----------------------------
 load_dotenv()
 
+app = FastAPI(title="ScreenSnapp API")
+
 # ----------------------------
-# Required ENV
+# CORS (safe default)
+# ----------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten later if you want
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----------------------------
+# ENV / CONFIG
 # ----------------------------
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
 
@@ -27,228 +34,175 @@ CLARIFAI_PAT = os.getenv("CLARIFAI_PAT", "").strip()
 CLARIFAI_USER_ID = os.getenv("CLARIFAI_USER_ID", "").strip()
 CLARIFAI_APP_ID = os.getenv("CLARIFAI_APP_ID", "").strip()
 
-# OCR model you trained / are using
-CLARIFAI_OCR_MODEL_ID = os.getenv("CLARIFAI_OCR_MODEL_ID", "").strip()
-# optional (only if you use it)
-CLARIFAI_OCR_MODEL_VERSION_ID = os.getenv("CLARIFAI_OCR_MODEL_VERSION_ID", "").strip()
+# NEW: Model + version (what you asked about)
+CLARIFAI_MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "").strip()
+CLARIFAI_MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "").strip()
 
+# Optional: if you use TMDB later
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
-
-# If you want to allow starting without TMDB/Clarifai temporarily, set this to "1"
-ALLOW_MISSING_KEYS = os.getenv("ALLOW_MISSING_KEYS", "").strip() == "1"
-
-# ----------------------------
-# App
-# ----------------------------
-app = FastAPI(title="ScreenSnapp API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # you can lock this down later
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 security = HTTPBearer(auto_error=False)
 
 
-def require_env(name: str, value: str):
-    if not value:
-        raise RuntimeError(f"{name} is missing (Railway Variables -> add {name})")
+# ----------------------------
+# AUTH
+# ----------------------------
+def require_api_token(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    if not API_BEARER_TOKEN:
+        raise HTTPException(status_code=500, detail="Server misconfigured: API_BEARER_TOKEN missing")
 
+    if creds is None or creds.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-@app.on_event("startup")
-def validate_env():
-    if ALLOW_MISSING_KEYS:
-        return
-
-    require_env("API_BEARER_TOKEN", API_BEARER_TOKEN)
-    require_env("CLARIFAI_PAT", CLARIFAI_PAT)
-    require_env("CLARIFAI_USER_ID", CLARIFAI_USER_ID)
-    require_env("CLARIFAI_APP_ID", CLARIFAI_APP_ID)
-    require_env("CLARIFAI_OCR_MODEL_ID", CLARIFAI_OCR_MODEL_ID)
-    require_env("TMDB_API_KEY", TMDB_API_KEY)
-
-
-def auth_guard(creds: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    """
-    Expects: Authorization: Bearer <API_BEARER_TOKEN>
-    """
-    if not creds or creds.scheme.lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-
-    incoming = (creds.credentials or "").strip()
-    if not incoming or incoming != API_BEARER_TOKEN:
+    if creds.credentials != API_BEARER_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     return True
 
 
-def clarifai_ocr(image_bytes: bytes) -> str:
+# ----------------------------
+# MODELS
+# ----------------------------
+class IdentifyResponse(BaseModel):
+    model_id: str
+    model_version_id: Optional[str] = None
+    concepts: List[Dict[str, Any]]
+
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def _check_clarifai_env():
+    missing = []
+    if not CLARIFAI_PAT:
+        missing.append("CLARIFAI_PAT")
+    if not CLARIFAI_USER_ID:
+        missing.append("CLARIFAI_USER_ID")
+    if not CLARIFAI_APP_ID:
+        missing.append("CLARIFAI_APP_ID")
+    if not CLARIFAI_MODEL_ID:
+        missing.append("CLARIFAI_MODEL_ID")
+    # Version is strongly recommended, but you can run without it
+    # (Clarifai will use latest). We still allow it to be empty.
+
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Server misconfigured: missing {', '.join(missing)}")
+
+
+def _clarifai_outputs_url() -> str:
     """
-    Sends image to Clarifai OCR model and tries to extract text.
+    If CLARIFAI_MODEL_VERSION_ID is set, use it (best practice).
+    Otherwise call outputs without version (Clarifai uses latest).
     """
-    channel = ClarifaiChannel.get_grpc_channel()
-    stub = service_pb2_grpc.V2Stub(channel)
-
-    metadata = (("authorization", f"Key {CLARIFAI_PAT}"),)
-
-    input_data = resources_pb2.Input(
-        data=resources_pb2.Data(
-            image=resources_pb2.Image(base64=image_bytes)
-        )
-    )
-
-    model = resources_pb2.Model(
-        id=CLARIFAI_OCR_MODEL_ID
-    )
-
-    # If you have a version id, include it
-    if CLARIFAI_OCR_MODEL_VERSION_ID:
-        model.model_version.id = CLARIFAI_OCR_MODEL_VERSION_ID
-
-    request = service_pb2.PostModelOutputsRequest(
-        user_app_id=resources_pb2.UserAppIDSet(user_id=CLARIFAI_USER_ID, app_id=CLARIFAI_APP_ID),
-        model_id=model.id,
-        inputs=[input_data],
-    )
-
-    # If version ID is present, Clarifai expects it via model_version_id field
-    if CLARIFAI_OCR_MODEL_VERSION_ID:
-        request.model_version_id = CLARIFAI_OCR_MODEL_VERSION_ID
-
-    response = stub.PostModelOutputs(request, metadata=metadata)
-
-    if response.status.code != status_code_pb2.SUCCESS:
-        # This is usually where wrong PAT / wrong model id shows up
-        raise HTTPException(
-            status_code=502,
-            detail=f"Clarifai error: {response.status.description} ({response.status.code})"
-        )
-
-    # Try multiple common OCR result shapes
-    output = response.outputs[0]
-
-    # 1) Some OCR models populate data.text.raw
-    if output.data and output.data.text and output.data.text.raw:
-        return output.data.text.raw.strip()
-
-    # 2) Some return regions with text
-    texts: List[str] = []
-
-    if output.data and output.data.regions:
-        for r in output.data.regions:
-            try:
-                if r.data and r.data.text and r.data.text.raw:
-                    texts.append(r.data.text.raw.strip())
-            except Exception:
-                pass
-
-    if texts:
-        return " ".join(texts).strip()
-
-    # 3) Some return concepts with name-like text (less common for OCR)
-    if output.data and output.data.concepts:
-        concepts = [c.name for c in output.data.concepts if c.name]
-        if concepts:
-            return " ".join(concepts).strip()
-
-    return ""
+    base = f"https://api.clarifai.com/v2/users/{CLARIFAI_USER_ID}/apps/{CLARIFAI_APP_ID}/models/{CLARIFAI_MODEL_ID}"
+    if CLARIFAI_MODEL_VERSION_ID:
+        return f"{base}/versions/{CLARIFAI_MODEL_VERSION_ID}/outputs"
+    return f"{base}/outputs"
 
 
-def clean_query(text: str) -> str:
-    # Keep it simple: remove weird spacing + very long text
-    text = re.sub(r"\s+", " ", text).strip()
-    # If OCR returns a ton of junk, limit query length
-    return text[:120]
+def _clarifai_request(image_bytes: bytes) -> Dict[str, Any]:
+    _check_clarifai_env()
 
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    url = _clarifai_outputs_url()
 
-def tmdb_search(query: str) -> Dict[str, Any]:
-    """
-    Uses TMDB v3 API key (the short hex key), not the long JWT read token.
-    """
-    url = "https://api.themoviedb.org/3/search/multi"
-    params = {
-        "api_key": TMDB_API_KEY,
-        "query": query,
-        "include_adult": "false",
-        "language": "en-US",
-        "page": 1,
+    headers = {
+        "Authorization": f"Key {CLARIFAI_PAT}",
+        "Content-Type": "application/json",
     }
 
-    r = requests.get(url, params=params, timeout=15)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"TMDB error: {r.status_code} {r.text}")
-
-    data = r.json()
-    results = data.get("results") or []
-    if not results:
-        return {"found": False, "query": query, "results": []}
-
-    best = results[0]
-    media_type = best.get("media_type")
-    tmdb_id = best.get("id")
-
-    title = best.get("title") or best.get("name") or ""
-    date = best.get("release_date") or best.get("first_air_date") or ""
-    overview = best.get("overview") or ""
-    poster_path = best.get("poster_path")
-
-    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
-    tmdb_page = None
-    if media_type == "movie":
-        tmdb_page = f"https://www.themoviedb.org/movie/{tmdb_id}"
-    elif media_type == "tv":
-        tmdb_page = f"https://www.themoviedb.org/tv/{tmdb_id}"
-
-    return {
-        "found": True,
-        "query": query,
-        "best": {
-            "media_type": media_type,
-            "id": tmdb_id,
-            "title": title,
-            "date": date,
-            "overview": overview,
-            "poster_url": poster_url,
-            "tmdb_page": tmdb_page,
-        },
-        "results_count": len(results),
+    payload = {
+        "inputs": [
+            {
+                "data": {
+                    "image": {
+                        "base64": b64
+                    }
+                }
+            }
+        ]
     }
 
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Clarifai request failed: {str(e)}")
 
+    if r.status_code >= 400:
+        # Return the body to help debug (Clarifai often returns useful details)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+
+        # Common: "Model does not exist (21200)" etc.
+        raise HTTPException(status_code=502, detail=f"Clarifai error: {body}")
+
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Clarifai returned non-JSON response")
+
+
+def _extract_concepts(clarifai_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Pull top concepts from Clarifai response.
+    Your custom model will usually return concepts with (name, value).
+    """
+    outputs = clarifai_json.get("outputs", [])
+    if not outputs:
+        return []
+
+    data = outputs[0].get("data", {})
+    concepts = data.get("concepts", []) or []
+    # Keep it small + consistent
+    cleaned = []
+    for c in concepts[:10]:
+        cleaned.append({
+            "name": c.get("name") or c.get("id"),
+            "value": c.get("value"),
+            "id": c.get("id"),
+        })
+    return cleaned
+
+
+# ----------------------------
+# ROUTES
+# ----------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.post("/identify-screen")
-async def identify_screen(
+@app.post("/identify", response_model=IdentifyResponse)
+async def identify_image(
+    authorized: bool = Depends(require_api_token),
     file: UploadFile = File(...),
-    _auth: bool = Depends(auth_guard),
 ):
-    if not file:
-        raise HTTPException(status_code=400, detail="Missing file")
+    # Basic file validation
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file")
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty upload")
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
 
-    # OCR
-    text = clarifai_ocr(content)
-    if not text:
-        raise HTTPException(status_code=422, detail="No OCR text extracted")
+    clarifai_json = _clarifai_request(image_bytes)
+    concepts = _extract_concepts(clarifai_json)
 
-    query = clean_query(text)
-    if not TMDB_API_KEY:
-        return {"ocr_text": text, "query": query, "tmdb": {"found": False, "reason": "TMDB_API_KEY missing"}}
+    return IdentifyResponse(
+        model_id=CLARIFAI_MODEL_ID,
+        model_version_id=CLARIFAI_MODEL_VERSION_ID or None,
+        concepts=concepts,
+    )
 
-    # TMDB search
-    tmdb = tmdb_search(query)
 
-    return {
-        "ocr_text": text,
-        "query": query,
-        "tmdb": tmdb,
-    }
+# Optional alias if your iOS app calls a different path
+@app.post("/identify-screen", response_model=IdentifyResponse)
+async def identify_screen(
+    authorized: bool = Depends(require_api_token),
+    file: UploadFile = File(...),
+):
+    return await identify_image(authorized=authorized, file=file)
