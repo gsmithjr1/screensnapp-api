@@ -2,7 +2,7 @@
 import os
 import base64
 import requests
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -36,6 +36,10 @@ CLARIFAI_MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "").strip()  
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()  # optional for later
 
+# Confidence thresholds (tune these later)
+HIGH_CONF = float(os.getenv("HIGH_CONF", "0.85"))
+MED_CONF = float(os.getenv("MED_CONF", "0.65"))
+
 security = HTTPBearer(auto_error=False)
 
 # ----------------------------
@@ -57,14 +61,20 @@ def require_api_token(
 
 
 # ----------------------------
-# RESPONSE MODEL
+# RESPONSE MODELS
 # ----------------------------
-class IdentifyResponse(BaseModel):
-    title: Optional[str] = None
-    confidence: Optional[float] = None
+class Match(BaseModel):
+    title: str
+    score: float
+    id: Optional[str] = None
+
+class IdentifyResponseV2(BaseModel):
+    best_title: Optional[str] = None
+    best_score: Optional[float] = None
+    confidence_level: Literal["high", "medium", "low", "none"] = "none"
+    matches: List[Match] = []
     model_id: str
     model_version_id: Optional[str] = None
-    concepts: List[Dict[str, Any]]
 
 
 # ----------------------------
@@ -86,10 +96,6 @@ def _check_clarifai_env():
 
 
 def _clarifai_outputs_url() -> str:
-    """
-    If CLARIFAI_MODEL_VERSION_ID is set, use it.
-    Otherwise Clarifai will use the latest model version.
-    """
     base = f"https://api.clarifai.com/v2/users/{CLARIFAI_USER_ID}/apps/{CLARIFAI_APP_ID}/models/{CLARIFAI_MODEL_ID}"
     if CLARIFAI_MODEL_VERSION_ID:
         return f"{base}/versions/{CLARIFAI_MODEL_VERSION_ID}/outputs"
@@ -108,15 +114,7 @@ def _clarifai_request(image_bytes: bytes) -> Dict[str, Any]:
     }
 
     payload = {
-        "inputs": [
-            {
-                "data": {
-                    "image": {
-                        "base64": b64
-                    }
-                }
-            }
-        ]
+        "inputs": [{"data": {"image": {"base64": b64}}}]
     }
 
     try:
@@ -137,7 +135,7 @@ def _clarifai_request(image_bytes: bytes) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail="Clarifai returned non-JSON response")
 
 
-def _extract_concepts(clarifai_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_top_matches(clarifai_json: Dict[str, Any], limit: int = 5) -> List[Match]:
     outputs = clarifai_json.get("outputs", [])
     if not outputs:
         return []
@@ -145,31 +143,31 @@ def _extract_concepts(clarifai_json: Dict[str, Any]) -> List[Dict[str, Any]]:
     data = outputs[0].get("data", {})
     concepts = data.get("concepts", []) or []
 
-    cleaned = []
-    for c in concepts[:10]:
-        cleaned.append({
-            "name": c.get("name") or c.get("id"),
-            "value": c.get("value"),
-            "id": c.get("id"),
-        })
-    return cleaned
+    matches: List[Match] = []
+    for c in concepts[:limit]:
+        name = c.get("name") or c.get("id") or "unknown"
+        val = c.get("value")
+        try:
+            score = float(val) if val is not None else 0.0
+        except Exception:
+            score = 0.0
+
+        matches.append(Match(
+            title=name,
+            score=round(score, 4),
+            id=c.get("id"),
+        ))
+    return matches
 
 
-def _title_from_concepts(concepts: List[Dict[str, Any]]) -> (Optional[str], Optional[float]):
-    """
-    Pick the top concept as the title.
-    """
-    if not concepts:
-        return None, None
-
-    top = concepts[0]
-    title = top.get("name")
-    value = top.get("value")
-    if value is None:
-        return title, None
-
-    # round to 2 decimals for UI
-    return title, round(float(value), 2)
+def _confidence_level(best_score: Optional[float]) -> str:
+    if best_score is None:
+        return "none"
+    if best_score >= HIGH_CONF:
+        return "high"
+    if best_score >= MED_CONF:
+        return "medium"
+    return "low"
 
 
 # ----------------------------
@@ -180,7 +178,7 @@ def health():
     return {"ok": True}
 
 
-@app.post("/identify", response_model=IdentifyResponse)
+@app.post("/identify", response_model=IdentifyResponseV2)
 async def identify_image(
     authorized: bool = Depends(require_api_token),
     file: UploadFile = File(...),
@@ -193,19 +191,26 @@ async def identify_image(
         raise HTTPException(status_code=400, detail="Empty file")
 
     clarifai_json = _clarifai_request(image_bytes)
-    concepts = _extract_concepts(clarifai_json)
-    title, confidence = _title_from_concepts(concepts)
+    matches = _extract_top_matches(clarifai_json, limit=5)
 
-    return IdentifyResponse(
-        title=title,
-        confidence=confidence,
+    best_title = matches[0].title if matches else None
+    best_score = matches[0].score if matches else None
+    level = _confidence_level(best_score)
+
+    # Don’t force a title if low confidence (prevents wrong answers)
+    final_title = best_title if level in ("high", "medium") else None
+
+    return IdentifyResponseV2(
+        best_title=final_title,
+        best_score=best_score,
+        confidence_level=level,
+        matches=matches,
         model_id=CLARIFAI_MODEL_ID,
         model_version_id=CLARIFAI_MODEL_VERSION_ID or None,
-        concepts=concepts,
     )
 
 
-@app.post("/identify-screen", response_model=IdentifyResponse)
+@app.post("/identify-screen", response_model=IdentifyResponseV2)
 async def identify_screen(
     authorized: bool = Depends(require_api_token),
     file: UploadFile = File(...),
