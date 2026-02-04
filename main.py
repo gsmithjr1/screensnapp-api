@@ -317,6 +317,12 @@ def match(query_vec, topk=5):
     scored.sort(reverse=True, key=lambda x: x[0])
     return scored[:topk]
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
+
+
 
 
 
