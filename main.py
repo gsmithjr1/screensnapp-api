@@ -282,5 +282,41 @@ async def embed(file: UploadFile = File(...)):
         return {"dim": len(vec), "vector": vec}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+import os, json, requests, glob
+
+API = "https://YOUR-RAILWAY-URL/embed"
+
+db = []  # list of {"movie":..., "file":..., "vector":[...]}
+
+for movie_dir in glob.glob("frames/*"):
+    movie = os.path.basename(movie_dir)
+    for fp in glob.glob(os.path.join(movie_dir, "*.jpg")):
+        with open(fp, "rb") as f:
+            r = requests.post(API, files={"file": (os.path.basename(fp), f, "image/jpeg")})
+        r.raise_for_status()
+        vec = r.json()["vector"]
+        db.append({"movie": movie, "file": fp, "vector": vec})
+        print("embedded", movie, fp)
+
+with open("movie_db.json", "w") as f:
+    json.dump(db, f)
+print("saved", len(db), "vectors")
+
+import json, math
+
+def cosine(a, b):
+    dot = sum(x*y for x,y in zip(a,b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    return dot / (na*nb + 1e-9)
+
+db = json.load(open("movie_db.json"))
+
+def match(query_vec, topk=5):
+    scored = [(cosine(query_vec, item["vector"]), item["movie"], item["file"]) for item in db]
+    scored.sort(reverse=True, key=lambda x: x[0])
+    return scored[:topk]
+
+
 
 
