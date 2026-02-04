@@ -216,3 +216,71 @@ async def identify_screen(
     file: UploadFile = File(...),
 ):
     return await identify_image(authorized=authorized, file=file)
+
+# embed.py (or inside main.py)
+import os
+from typing import List
+from fastapi import FastAPI, UploadFile, File, HTTPException
+
+from clarifai_grpc.channel.clarifai_channel import ClarifaiChannel
+from clarifai_grpc.grpc.api import service_pb2, service_pb2_grpc, resources_pb2
+from clarifai_grpc.grpc.api.status import status_code_pb2
+
+CLARIFAI_PAT = os.getenv("CLARIFAI_PAT", "").strip()
+CLARIFAI_USER_ID = os.getenv("CLARIFAI_USER_ID", "").strip()
+CLARIFAI_APP_ID = os.getenv("CLARIFAI_APP_ID", "").strip()
+CLARIFAI_MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "").strip()
+CLARIFAI_MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "").strip()  # optional
+
+app = FastAPI()
+
+def clarifai_embed(image_bytes: bytes) -> List[float]:
+    if not (CLARIFAI_PAT and CLARIFAI_USER_ID and CLARIFAI_APP_ID and CLARIFAI_MODEL_ID):
+        raise RuntimeError("Missing Clarifai env vars")
+
+    channel = ClarifaiChannel.get_grpc_channel()
+    stub = service_pb2_grpc.V2Stub(channel)
+
+    metadata = (("authorization", f"Key {CLARIFAI_PAT}"),)
+
+    model = resources_pb2.Model(
+        id=CLARIFAI_MODEL_ID,
+        user_id=CLARIFAI_USER_ID,
+        app_id=CLARIFAI_APP_ID,
+    )
+    # If you have a fixed version, set it:
+    if CLARIFAI_MODEL_VERSION_ID:
+        model.model_version.id = CLARIFAI_MODEL_VERSION_ID
+
+    request = service_pb2.PostModelOutputsRequest(
+        model_id=model.id,
+        user_app_id=resources_pb2.UserAppIDSet(user_id=CLARIFAI_USER_ID, app_id=CLARIFAI_APP_ID),
+        inputs=[resources_pb2.Input(data=resources_pb2.Data(image=resources_pb2.Image(base64=image_bytes)))],
+    )
+
+    response = stub.PostModelOutputs(request, metadata=metadata)
+
+    if response.status.code != status_code_pb2.SUCCESS:
+        raise RuntimeError(f"Clarifai error: {response.status.description}")
+
+    # IMPORTANT: Embeddings live under output.data.embeddings[0].vector
+    output = response.outputs[0]
+    if not output.data.embeddings:
+        raise RuntimeError("No embeddings returned (wrong model type?)")
+
+    vec = list(output.data.embeddings[0].vector)
+    return vec
+
+@app.post("/embed")
+async def embed(file: UploadFile = File(...)):
+    img = await file.read()
+    if not img:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    try:
+        vec = clarifai_embed(img)
+        return {"dim": len(vec), "vector": vec}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
