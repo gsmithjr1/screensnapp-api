@@ -1,4 +1,3 @@
-# main.py
 import os
 import base64
 import requests
@@ -34,9 +33,11 @@ CLARIFAI_APP_ID = os.getenv("CLARIFAI_APP_ID", "").strip()
 CLARIFAI_MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "").strip()
 CLARIFAI_MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "").strip()  # optional but recommended
 
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()  # optional for later
+# optional for later
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+CLARIFAI_OCR_MODEL_ID = os.getenv("CLARIFAI_OCR_MODEL_ID", "").strip()
 
-# Confidence thresholds (tune these later)
+# Confidence thresholds
 HIGH_CONF = float(os.getenv("HIGH_CONF", "0.85"))
 MED_CONF = float(os.getenv("MED_CONF", "0.65"))
 
@@ -95,27 +96,24 @@ def _check_clarifai_env():
         raise HTTPException(status_code=500, detail=f"Server misconfigured: missing {', '.join(missing)}")
 
 
-def _clarifai_outputs_url() -> str:
-    base = f"https://api.clarifai.com/v2/users/{CLARIFAI_USER_ID}/apps/{CLARIFAI_APP_ID}/models/{CLARIFAI_MODEL_ID}"
-    if CLARIFAI_MODEL_VERSION_ID:
-        return f"{base}/versions/{CLARIFAI_MODEL_VERSION_ID}/outputs"
+def _clarifai_model_outputs_url(model_id: str, model_version_id: str = "") -> str:
+    base = f"https://api.clarifai.com/v2/users/{CLARIFAI_USER_ID}/apps/{CLARIFAI_APP_ID}/models/{model_id}"
+    if model_version_id:
+        return f"{base}/versions/{model_version_id}/outputs"
     return f"{base}/outputs"
 
 
-def _clarifai_request(image_bytes: bytes) -> Dict[str, Any]:
-    _check_clarifai_env()
-
+def _clarifai_post_outputs(image_bytes: bytes, model_id: str, model_version_id: str = "") -> Dict[str, Any]:
     b64 = base64.b64encode(image_bytes).decode("utf-8")
-    url = _clarifai_outputs_url()
 
     headers = {
         "Authorization": f"Key {CLARIFAI_PAT}",
         "Content-Type": "application/json",
     }
 
-    payload = {
-        "inputs": [{"data": {"image": {"base64": b64}}}]
-    }
+    payload = {"inputs": [{"data": {"image": {"base64": b64}}}]}
+
+    url = _clarifai_model_outputs_url(model_id, model_version_id)
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -135,7 +133,7 @@ def _clarifai_request(image_bytes: bytes) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail="Clarifai returned non-JSON response")
 
 
-def _extract_top_matches(clarifai_json: Dict[str, Any], limit: int = 5) -> List[Match]:
+def _extract_top_concepts(clarifai_json: Dict[str, Any], limit: int = 5) -> List[Match]:
     outputs = clarifai_json.get("outputs", [])
     if not outputs:
         return []
@@ -160,6 +158,27 @@ def _extract_top_matches(clarifai_json: Dict[str, Any], limit: int = 5) -> List[
     return matches
 
 
+def _extract_embedding_vector(clarifai_json: Dict[str, Any]) -> List[float]:
+    outputs = clarifai_json.get("outputs", [])
+    if not outputs:
+        return []
+
+    data = outputs[0].get("data", {})
+    embeddings = data.get("embeddings", []) or []
+    if not embeddings:
+        return []
+
+    vec = embeddings[0].get("vector", []) or []
+    # ensure float list
+    out: List[float] = []
+    for x in vec:
+        try:
+            out.append(float(x))
+        except Exception:
+            pass
+    return out
+
+
 def _confidence_level(best_score: Optional[float]) -> str:
     if best_score is None:
         return "none"
@@ -178,11 +197,32 @@ def health():
     return {"ok": True}
 
 
+# TEMP: use to confirm Railway is wired right (remove after)
+@app.get("/debug/env")
+def debug_env(authorized: bool = Depends(require_api_token)):
+    def safe(v: str) -> str:
+        if not v:
+            return ""
+        return v[:4] + "..." + v[-4:]
+
+    return {
+        "CLARIFAI_USER_ID": safe(CLARIFAI_USER_ID),
+        "CLARIFAI_APP_ID": safe(CLARIFAI_APP_ID),
+        "CLARIFAI_MODEL_ID": safe(CLARIFAI_MODEL_ID),
+        "CLARIFAI_MODEL_VERSION_ID": safe(CLARIFAI_MODEL_VERSION_ID),
+        "CLARIFAI_OCR_MODEL_ID": safe(CLARIFAI_OCR_MODEL_ID),
+        "TMDB_API_KEY_SET": bool(TMDB_API_KEY),
+        "PAT_SET": bool(CLARIFAI_PAT),
+    }
+
+
 @app.post("/identify", response_model=IdentifyResponseV2)
 async def identify_image(
     authorized: bool = Depends(require_api_token),
     file: UploadFile = File(...),
 ):
+    _check_clarifai_env()
+
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Please upload an image file")
 
@@ -190,14 +230,13 @@ async def identify_image(
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    clarifai_json = _clarifai_request(image_bytes)
-    matches = _extract_top_matches(clarifai_json, limit=5)
+    clarifai_json = _clarifai_post_outputs(image_bytes, CLARIFAI_MODEL_ID, CLARIFAI_MODEL_VERSION_ID)
+    matches = _extract_top_concepts(clarifai_json, limit=5)
 
     best_title = matches[0].title if matches else None
     best_score = matches[0].score if matches else None
     level = _confidence_level(best_score)
 
-    # Don’t force a title if low confidence (prevents wrong answers)
     final_title = best_title if level in ("high", "medium") else None
 
     return IdentifyResponseV2(
@@ -210,119 +249,24 @@ async def identify_image(
     )
 
 
-@app.post("/identify-screen", response_model=IdentifyResponseV2)
-async def identify_screen(
+@app.post("/embed")
+async def embed_image(
     authorized: bool = Depends(require_api_token),
     file: UploadFile = File(...),
 ):
-    return await identify_image(authorized=authorized, file=file)
+    _check_clarifai_env()
 
-# embed.py (or inside main.py)
-import os
-from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file")
 
-from clarifai_grpc.channel.clarifai_channel import ClarifaiChannel
-from clarifai_grpc.grpc.api import service_pb2, service_pb2_grpc, resources_pb2
-from clarifai_grpc.grpc.api.status import status_code_pb2
-
-CLARIFAI_PAT = os.getenv("CLARIFAI_PAT", "").strip()
-CLARIFAI_USER_ID = os.getenv("CLARIFAI_USER_ID", "").strip()
-CLARIFAI_APP_ID = os.getenv("CLARIFAI_APP_ID", "").strip()
-CLARIFAI_MODEL_ID = os.getenv("CLARIFAI_MODEL_ID", "").strip()
-CLARIFAI_MODEL_VERSION_ID = os.getenv("CLARIFAI_MODEL_VERSION_ID", "").strip()  # optional
-
-app = FastAPI()
-
-def clarifai_embed(image_bytes: bytes) -> List[float]:
-    if not (CLARIFAI_PAT and CLARIFAI_USER_ID and CLARIFAI_APP_ID and CLARIFAI_MODEL_ID):
-        raise RuntimeError("Missing Clarifai env vars")
-
-    channel = ClarifaiChannel.get_grpc_channel()
-    stub = service_pb2_grpc.V2Stub(channel)
-
-    metadata = (("authorization", f"Key {CLARIFAI_PAT}"),)
-
-    model = resources_pb2.Model(
-        id=CLARIFAI_MODEL_ID,
-        user_id=CLARIFAI_USER_ID,
-        app_id=CLARIFAI_APP_ID,
-    )
-    # If you have a fixed version, set it:
-    if CLARIFAI_MODEL_VERSION_ID:
-        model.model_version.id = CLARIFAI_MODEL_VERSION_ID
-
-    request = service_pb2.PostModelOutputsRequest(
-        model_id=model.id,
-        user_app_id=resources_pb2.UserAppIDSet(user_id=CLARIFAI_USER_ID, app_id=CLARIFAI_APP_ID),
-        inputs=[resources_pb2.Input(data=resources_pb2.Data(image=resources_pb2.Image(base64=image_bytes)))],
-    )
-
-    response = stub.PostModelOutputs(request, metadata=metadata)
-
-    if response.status.code != status_code_pb2.SUCCESS:
-        raise RuntimeError(f"Clarifai error: {response.status.description}")
-
-    # IMPORTANT: Embeddings live under output.data.embeddings[0].vector
-    output = response.outputs[0]
-    if not output.data.embeddings:
-        raise RuntimeError("No embeddings returned (wrong model type?)")
-
-    vec = list(output.data.embeddings[0].vector)
-    return vec
-
-@app.post("/embed")
-async def embed(file: UploadFile = File(...)):
-    img = await file.read()
-    if not img:
+    image_bytes = await file.read()
+    if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    try:
-        vec = clarifai_embed(img)
-        return {"dim": len(vec), "vector": vec}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-import os, json, requests, glob
+    clarifai_json = _clarifai_post_outputs(image_bytes, CLARIFAI_MODEL_ID, CLARIFAI_MODEL_VERSION_ID)
+    vec = _extract_embedding_vector(clarifai_json)
 
-API = "https://YOUR-RAILWAY-URL/embed"
+    if not vec:
+        raise HTTPException(status_code=502, detail="No embeddings returned (model may not be an embedding model)")
 
-db = []  # list of {"movie":..., "file":..., "vector":[...]}
-
-for movie_dir in glob.glob("frames/*"):
-    movie = os.path.basename(movie_dir)
-    for fp in glob.glob(os.path.join(movie_dir, "*.jpg")):
-        with open(fp, "rb") as f:
-            r = requests.post(API, files={"file": (os.path.basename(fp), f, "image/jpeg")})
-        r.raise_for_status()
-        vec = r.json()["vector"]
-        db.append({"movie": movie, "file": fp, "vector": vec})
-        print("embedded", movie, fp)
-
-with open("movie_db.json", "w") as f:
-    json.dump(db, f)
-print("saved", len(db), "vectors")
-
-import json, math
-
-def cosine(a, b):
-    dot = sum(x*y for x,y in zip(a,b))
-    na = math.sqrt(sum(x*x for x in a))
-    nb = math.sqrt(sum(y*y for y in b))
-    return dot / (na*nb + 1e-9)
-
-db = json.load(open("movie_db.json"))
-
-def match(query_vec, topk=5):
-    scored = [(cosine(query_vec, item["vector"]), item["movie"], item["file"]) for item in db]
-    scored.sort(reverse=True, key=lambda x: x[0])
-    return scored[:topk]
-
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
-
-
-
-
-
-
+    return {"dim": len(vec), "vector": vec}
