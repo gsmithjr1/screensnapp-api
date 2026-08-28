@@ -408,7 +408,7 @@ def _call_grok_for_image(
             "https://api.x.ai/v1/responses",
             headers=headers,
             json=payload,
-            timeout=60,
+            timeout=120,
         )
 
     except requests.RequestException as e:
