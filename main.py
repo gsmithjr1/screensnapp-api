@@ -1,4 +1,5 @@
 import os
+import json
 import base64
 import requests
 from typing import Optional, List, Dict, Any, Literal
@@ -23,9 +24,9 @@ app.add_middleware(
 )
 
 
-# ----------------------------
+# ============================================================
 # ENV / CONFIG
-# ----------------------------
+# ============================================================
 
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
 
@@ -40,6 +41,7 @@ CLARIFAI_MODEL_VERSION_ID = os.getenv(
 ).strip()
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+
 CLARIFAI_OCR_MODEL_ID = os.getenv(
     "CLARIFAI_OCR_MODEL_ID",
     ""
@@ -57,9 +59,9 @@ MED_CONF = float(os.getenv("MED_CONF", "0.65"))
 security = HTTPBearer(auto_error=False)
 
 
-# ----------------------------
+# ============================================================
 # AUTH
-# ----------------------------
+# ============================================================
 
 def require_api_token(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
@@ -85,9 +87,9 @@ def require_api_token(
     return True
 
 
-# ----------------------------
+# ============================================================
 # RESPONSE MODELS
-# ----------------------------
+# ============================================================
 
 class Match(BaseModel):
     title: str
@@ -98,20 +100,33 @@ class Match(BaseModel):
 class IdentifyResponseV2(BaseModel):
     best_title: Optional[str] = None
     best_score: Optional[float] = None
+
     confidence_level: Literal[
         "high",
         "medium",
         "low",
         "none"
     ] = "none"
+
     matches: List[Match] = []
+
     model_id: str
     model_version_id: Optional[str] = None
 
 
-# ----------------------------
-# HELPERS
-# ----------------------------
+class GrokIdentifyResponse(BaseModel):
+    title: str
+    year: Optional[int] = None
+    type: Literal[
+        "movie",
+        "tv",
+        "unknown"
+    ]
+
+
+# ============================================================
+# CLARIFAI HELPERS
+# ============================================================
 
 def _check_clarifai_env():
     missing = []
@@ -131,7 +146,10 @@ def _check_clarifai_env():
     if missing:
         raise HTTPException(
             status_code=500,
-            detail=f"Server misconfigured: missing {', '.join(missing)}"
+            detail=(
+                "Server misconfigured: missing "
+                + ", ".join(missing)
+            )
         )
 
 
@@ -148,7 +166,10 @@ def _clarifai_model_outputs_url(
     )
 
     if model_version_id:
-        return f"{base}/versions/{model_version_id}/outputs"
+        return (
+            f"{base}/versions/"
+            f"{model_version_id}/outputs"
+        )
 
     return f"{base}/outputs"
 
@@ -196,12 +217,16 @@ def _clarifai_post_outputs(
     except requests.RequestException as e:
         raise HTTPException(
             status_code=502,
-            detail=f"Clarifai request failed: {str(e)}"
+            detail=(
+                f"Clarifai request failed: {str(e)}"
+            )
         )
 
     if r.status_code >= 400:
+
         try:
             body = r.json()
+
         except Exception:
             body = {
                 "raw": r.text
@@ -263,6 +288,7 @@ def _extract_top_concepts(
                 if val is not None
                 else 0.0
             )
+
         except Exception:
             score = 0.0
 
@@ -310,10 +336,12 @@ def _extract_embedding_vector(
     out: List[float] = []
 
     for x in vec:
+
         try:
             out.append(
                 float(x)
             )
+
         except Exception:
             pass
 
@@ -336,6 +364,10 @@ def _confidence_level(
     return "low"
 
 
+# ============================================================
+# GROK HELPER
+# ============================================================
+
 def _call_grok_for_image(
     image_bytes: bytes,
     content_type: str
@@ -354,8 +386,10 @@ def _call_grok_for_image(
     ):
         raise HTTPException(
             status_code=400,
-            detail="Grok test requires a JPG or PNG image"
+            detail="Grok requires a JPG or PNG image"
         )
+
+    # Convert image to base64
 
     b64 = base64.b64encode(
         image_bytes
@@ -370,8 +404,18 @@ def _call_grok_for_image(
         "Content-Type": "application/json",
     }
 
+    # --------------------------------------------------------
+    # GROK REQUEST
+    # --------------------------------------------------------
+
     payload = {
         "model": "grok-4.6",
+
+        # Lower reasoning should reduce recognition time.
+        "reasoning": {
+            "effort": "low"
+        },
+
         "input": [
             {
                 "role": "user",
@@ -384,24 +428,67 @@ def _call_grok_for_image(
                     {
                         "type": "input_text",
                         "text": (
-                            "Analyze this frame from a movie "
-                            "or television show. "
-                            "Identify the exact movie or TV series "
-                            "if possible. "
-                            "Return the title, release year, "
-                            "whether it is a movie or TV series, "
-                            "and the season and episode if you can "
-                            "determine them. "
-                            "Do not confidently invent an answer "
-                            "if the evidence is weak. "
-                            "Briefly explain what visual evidence "
-                            "led to the identification."
+                            "Identify the exact movie or television "
+                            "series shown in this image. "
+                            "Return the title and original release year. "
+                            "Classify it as movie or tv. "
+                            "If there is not enough visual evidence to "
+                            "identify the title reliably, return UNKNOWN. "
+                            "Do not explain your reasoning."
                         ),
                     },
                 ],
             }
         ],
+
+        # Force Grok to give ScreenSnapp a small JSON result.
+
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "screensnapp_identification",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+
+                    "properties": {
+
+                        "title": {
+                            "type": "string"
+                        },
+
+                        "year": {
+                            "type": [
+                                "integer",
+                                "null"
+                            ]
+                        },
+
+                        "type": {
+                            "type": "string",
+                            "enum": [
+                                "movie",
+                                "tv",
+                                "unknown"
+                            ]
+                        }
+                    },
+
+                    "required": [
+                        "title",
+                        "year",
+                        "type"
+                    ],
+
+                    "additionalProperties": False
+                }
+            }
+        }
     }
+
+    # --------------------------------------------------------
+    # SEND REQUEST
+    # --------------------------------------------------------
 
     try:
         r = requests.post(
@@ -411,11 +498,21 @@ def _call_grok_for_image(
             timeout=120,
         )
 
+    except requests.Timeout:
+        raise HTTPException(
+            status_code=504,
+            detail="Grok recognition timed out"
+        )
+
     except requests.RequestException as e:
         raise HTTPException(
             status_code=502,
             detail=f"Grok request failed: {str(e)}"
         )
+
+    # --------------------------------------------------------
+    # CHECK GROK RESPONSE
+    # --------------------------------------------------------
 
     if r.status_code >= 400:
 
@@ -433,7 +530,7 @@ def _call_grok_for_image(
         )
 
     try:
-        return r.json()
+        data = r.json()
 
     except Exception:
         raise HTTPException(
@@ -441,10 +538,69 @@ def _call_grok_for_image(
             detail="Grok returned a non-JSON response"
         )
 
+    # --------------------------------------------------------
+    # FIND GROK'S OUTPUT TEXT
+    # --------------------------------------------------------
 
-# ----------------------------
+    output_text = None
+
+    for item in data.get("output", []):
+
+        if item.get("type") != "message":
+            continue
+
+        for content in item.get(
+            "content",
+            []
+        ):
+
+            if content.get("type") == "output_text":
+
+                output_text = content.get(
+                    "text"
+                )
+
+                break
+
+        if output_text:
+            break
+
+    if not output_text:
+        raise HTTPException(
+            status_code=502,
+            detail="Grok returned no identification"
+        )
+
+    # --------------------------------------------------------
+    # CONVERT GROK JSON TEXT INTO PYTHON DICTIONARY
+    # --------------------------------------------------------
+
+    try:
+        result = json.loads(
+            output_text
+        )
+
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not parse Grok identification"
+        )
+
+    return result
+
+
+# ============================================================
 # ROUTES
-# ----------------------------
+# ============================================================
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "ScreenSnapp API",
+        "status": "running"
+    }
+
 
 @app.get("/health")
 def health():
@@ -453,9 +609,9 @@ def health():
     }
 
 
-# TEMP:
-# Use this to confirm Railway is wired correctly.
-# Remove later.
+# ============================================================
+# DEBUG ENV
+# ============================================================
 
 @app.get("/debug/env")
 def debug_env(
@@ -465,6 +621,7 @@ def debug_env(
 ):
 
     def safe(v: str) -> str:
+
         if not v:
             return ""
 
@@ -475,32 +632,44 @@ def debug_env(
         )
 
     return {
+
         "CLARIFAI_USER_ID": safe(
             CLARIFAI_USER_ID
         ),
+
         "CLARIFAI_APP_ID": safe(
             CLARIFAI_APP_ID
         ),
+
         "CLARIFAI_MODEL_ID": safe(
             CLARIFAI_MODEL_ID
         ),
+
         "CLARIFAI_MODEL_VERSION_ID": safe(
             CLARIFAI_MODEL_VERSION_ID
         ),
+
         "CLARIFAI_OCR_MODEL_ID": safe(
             CLARIFAI_OCR_MODEL_ID
         ),
+
         "TMDB_API_KEY_SET": bool(
             TMDB_API_KEY
         ),
+
         "PAT_SET": bool(
             CLARIFAI_PAT
         ),
+
         "XAI_API_KEY_SET": bool(
             XAI_API_KEY
         ),
     }
 
+
+# ============================================================
+# CLARIFAI IDENTIFY
+# ============================================================
 
 @app.post(
     "/identify",
@@ -583,6 +752,10 @@ async def identify_image(
     )
 
 
+# ============================================================
+# CLARIFAI EMBEDDING
+# ============================================================
+
 @app.post("/embed")
 async def embed_image(
     authorized: bool = Depends(
@@ -637,7 +810,14 @@ async def embed_image(
     }
 
 
-@app.post("/identify-grok")
+# ============================================================
+# GROK IDENTIFY
+# ============================================================
+
+@app.post(
+    "/identify-grok",
+    response_model=GrokIdentifyResponse
+)
 async def identify_grok(
     authorized: bool = Depends(
         require_api_token
@@ -664,9 +844,21 @@ async def identify_grok(
             detail="Empty file"
         )
 
-    grok_json = _call_grok_for_image(
+    result = _call_grok_for_image(
         image_bytes,
         file.content_type
     )
 
-    return grok_json
+    return GrokIdentifyResponse(
+        title=result.get(
+            "title",
+            "UNKNOWN"
+        ),
+        year=result.get(
+            "year"
+        ),
+        type=result.get(
+            "type",
+            "unknown"
+        ),
+    )
